@@ -1,0 +1,142 @@
+ 
+CREATE FUNCTION  getNanosSinceEpoch( IN dt CHAR )
+ RETURNS INTEGER
+ LANGUAGE JAVA 
+ EXTERNAL NAME "iib.utility.time.Time.getNanosSinceEpoch";
+
+DECLARE INFLUX_DB EXTERNAL CHAR 'DB';
+
+CREATE COMPUTE MODULE Statistics_InfluxDB_convertToInflux
+	CREATE FUNCTION Main() RETURNS BOOLEAN
+	BEGIN
+		DECLARE NL CONSTANT CHAR CAST(X'0A' AS CHAR CCSID 1208);
+		CALL CopyMessageHeaders();
+		-- CALL CopyEntireMessage();
+		SET OutputRoot.MQMD = NULL;
+		SET OutputRoot.MQRFH2 = NULL;
+		
+		SET OutputLocalEnvironment = InputLocalEnvironment;
+		SET OutputLocalEnvironment.Destination.HTTP.QueryString.db = INFLUX_DB;
+		
+		DECLARE stats REFERENCE TO InputRoot.JSON.Data.WMQIStatisticsAccounting;
+		DECLARE statsMsgFlow REFERENCE TO stats.MessageFlow;
+		DECLARE statsNodes REFERENCE TO stats.Nodes;
+		
+		-- get endtime of record
+		DECLARE GMTEndTime CHAR statsMsgFlow.GMTEndTime;
+		DECLARE influxTS_int INTEGER getNanosSinceEpoch(GMTEndTime);
+		DECLARE influxTS  CHAR ' ' || CAST(influxTS_int AS CHAR );
+		
+		DECLARE flow CHAR statsMsgFlow.MessageFlowName;
+		DECLARE application CHAR statsMsgFlow.ApplicationName;
+		DECLARE EG CHAR statsMsgFlow.ExecutionGroupName;
+		DECLARE broker CHAR statsMsgFlow.BrokerLabel;
+		DECLARE tags CHAR ',flow=' || flow
+						|| ',application=' || application
+						|| ',EG=' || EG
+						|| ',broker=' || broker 
+						;
+						
+		-- build msgflow record
+		DECLARE measFlow CHAR;
+		SET measFlow = 'flow' || tags || ' ';
+
+		-- loop through attributes from TotalElapsedTime to the end
+		DECLARE attributeRef REFERENCE TO statsMsgFlow.GMTEndTime;
+		DECLARE firstAttribute BOOLEAN TRUE;
+
+		WHILE LASTMOVE(attributeRef) = TRUE DO
+			MOVE attributeRef NEXTSIBLING;
+			
+			DECLARE name CHAR FIELDNAME(attributeRef);
+			
+			IF CONTAINS(name, 'NumberOf') OR CONTAINS(name, 'SizeOf') OR CONTAINS(name, 'TotalInput') THEN
+				DECLARE value INT FIELDVALUE(attributeRef);
+			
+				IF firstAttribute THEN
+					SET firstAttribute = FALSE;
+				ELSE
+					SET measFlow = measFlow || ',';
+				END IF;
+				SET measFlow = measFlow || name || '=' || CAST(value as CHAR);
+				
+			ELSEIF CONTAINS(name, 'Time') THEN
+				DECLARE value INT FIELDVALUE(attributeRef);
+			
+				DECLARE valDecimal DECIMAL CAST(value AS DECIMAL) / 1000.0;
+				
+				IF firstAttribute THEN
+					SET firstAttribute = FALSE;
+				ELSE
+					SET measFlow = measFlow || ',';
+				END IF;
+				SET measFlow = measFlow || name || '=' || CAST(valDecimal as CHAR);
+			END IF;
+		
+		END WHILE;
+		
+		DECLARE points CHAR measFlow || influxTS;
+		
+		-- loop through the nodes and create a measurement for each
+		FOR node AS statsNodes.Item[] DO
+			DECLARE measure CHAR;
+			
+			DECLARE maxElapsedTime DECIMAL CAST (node.MaximumElapsedTime AS DECIMAL);
+			-- specify measurement and tags
+			SET measure = 'node,name=' || TRANSLATE(node.Label, ' ', '-')
+						|| tags 
+						|| ' ';
+						
+			DECLARE nodeAttributeRef REFERENCE TO node.Type;
+			DECLARE firstNodeAttribute BOOLEAN TRUE;
+			
+			WHILE LASTMOVE(nodeAttributeRef) = TRUE DO
+				MOVE nodeAttributeRef NEXTSIBLING;
+				
+				DECLARE name CHAR FIELDNAME(nodeAttributeRef);
+				
+				IF CONTAINS(name, 'Time') THEN
+					DECLARE value INT FIELDVALUE(nodeAttributeRef);
+				
+					DECLARE valDecimal DECIMAL CAST(value AS DECIMAL) / 1000.0;
+					
+					IF firstNodeAttribute THEN
+						SET firstNodeAttribute = FALSE;
+					ELSE
+						SET measure = measure || ',';
+					END IF;
+					SET measure = measure || name || '=' || CAST(valDecimal as CHAR);
+				ELSEIF CONTAINS(name, 'Count') THEN
+					DECLARE value INT FIELDVALUE(nodeAttributeRef);
+				
+					IF firstNodeAttribute THEN
+						SET firstNodeAttribute = FALSE;
+					ELSE
+						SET measure = measure || ',';
+					END IF;
+					SET measure = measure || name || '=' || CAST(value as CHAR);
+				END IF;
+			
+			END WHILE;
+			
+			SET points = points|| NL || measure || influxTS;
+		END FOR; 
+		
+		SET OutputRoot.BLOB.BLOB = CAST( points AS BLOB CCSID 1208);
+		RETURN TRUE;
+	END;
+
+	CREATE PROCEDURE CopyMessageHeaders() BEGIN
+		DECLARE I INTEGER 1;
+		DECLARE J INTEGER;
+		SET J = CARDINALITY(InputRoot.*[]);
+		WHILE I < J DO
+			SET OutputRoot.*[I] = InputRoot.*[I];
+			SET I = I + 1;
+		END WHILE;
+	END;
+
+	CREATE PROCEDURE CopyEntireMessage() BEGIN
+		SET OutputRoot = InputRoot;
+	END;
+END MODULE;
